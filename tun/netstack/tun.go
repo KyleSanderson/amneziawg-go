@@ -545,6 +545,15 @@ func randU16() uint16 {
 	return binary.LittleEndian.Uint16(b[:])
 }
 
+// dnsUDPBufSize is the EDNS0 requestor's buffer size advertised in queries
+// (RFC 6891) and the size of the buffer replies are read into. Queries
+// historically carried no OPT record, so upstreams capped replies at 512
+// bytes (RFC 1035), and replies were read into a fixed 512-byte buffer
+// that silently truncated anything larger. Replies for CNAME-heavy
+// domains routinely exceed 512 bytes, which made every lookup of such
+// domains fail with "cannot unmarshal DNS message".
+const dnsUDPBufSize = 4096
+
 func newRequest(q dnsmessage.Question) (id uint16, udpReq, tcpReq []byte, err error) {
 	id = randU16()
 	b := dnsmessage.NewBuilder(make([]byte, 2, 514), dnsmessage.Header{ID: id, RecursionDesired: true})
@@ -553,6 +562,19 @@ func newRequest(q dnsmessage.Question) (id uint16, udpReq, tcpReq []byte, err er
 		return 0, nil, nil, err
 	}
 	if err := b.Question(q); err != nil {
+		return 0, nil, nil, err
+	}
+	// Advertise an EDNS0 buffer so upstreams may send replies up to
+	// dnsUDPBufSize instead of truncating to 512 bytes.
+	if err := b.StartAdditionals(); err != nil {
+		return 0, nil, nil, err
+	}
+	var optHeader dnsmessage.ResourceHeader
+	var opt dnsmessage.OPTResource
+	if err := optHeader.SetEDNS0(dnsUDPBufSize, 0, false); err != nil {
+		return 0, nil, nil, err
+	}
+	if err := b.OPTResource(optHeader, opt); err != nil {
 		return 0, nil, nil, err
 	}
 	tcpReq, err = b.Finish()
@@ -600,7 +622,9 @@ func dnsPacketRoundTrip(c net.Conn, id uint16, query dnsmessage.Question, b []by
 	if _, err := c.Write(b); err != nil {
 		return dnsmessage.Parser{}, dnsmessage.Header{}, err
 	}
-	b = make([]byte, 512)
+	// Read the full reply: the advertised EDNS0 buffer allows replies up
+	// to dnsUDPBufSize, and UDP reads discard anything beyond the buffer.
+	b = make([]byte, dnsUDPBufSize)
 	for {
 		n, err := c.Read(b)
 		if err != nil {
